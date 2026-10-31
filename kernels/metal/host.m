@@ -31,7 +31,11 @@
 #define COMB_TABLE_LEN (COMB_WINDOWS * COMB_POS)
 #define COMB_STRIDE 32
 
-#define TARGET_SEC 0.75
+// Per-dispatch GPU time budget, adapted between launches. 0.75s
+// dispatches trip the macOS GPU watchdog ("Impacting Interactivity");
+// 0.15s keeps roughly 2x headroom at <1ms host cost per launch
+// (Team 4 watchdog cap only; see REVIEW_BOARD / INTEGRATION.md).
+#define TARGET_SEC 0.15
 
 static id<MTLDevice> g_dev;
 static id<MTLLibrary> g_lib;

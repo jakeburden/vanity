@@ -755,6 +755,13 @@ pub unsafe fn keygen_batch(
     pubs: &mut [[u8; 32]],
 ) {
     assert_eq!(seeds.len() % 4, 0);
+    let groups = seeds.len() / 4;
+    if groups == 0 {
+        return;
+    }
+    // Compute all points first, keeping hash/clamp/chain semantics per lane
+    // identical to the former per-group loop.
+    let mut points = Vec::with_capacity(groups);
     let mut off = 0;
     while off < seeds.len() {
         let mut sc = [[0u8; 32]; 4];
@@ -764,12 +771,26 @@ pub unsafe fn keygen_batch(
             sc[j] = clamp(&h);
             seeds[off + j].copy_from_slice(&h[32..64]);
         }
-        let p = scalarmult4(&sc);
-        let zinv = p.z.invert();
-        let out = compress4(&p, zinv);
-        pubs[off..off + 4].copy_from_slice(&out);
+        points.push(scalarmult4(&sc));
         off += 4;
     }
+    // Amortized Montgomery batch inversion (batch_invert) across the whole
+    // batch, mirroring `simd::batch_compress`: prefix products of all z,
+    // ONE `Fe4::invert`, then back-substitution.
+    let mut prefix = Vec::with_capacity(groups);
+    prefix.push(points[0].z);
+    for i in 1..groups {
+        prefix.push(prefix[i - 1].mul(points[i].z));
+    }
+    let mut inv = prefix[groups - 1].invert();
+    for i in (1..groups).rev() {
+        let zinv = inv.mul(prefix[i - 1]);
+        let out = compress4(&points[i], zinv);
+        pubs[i * 4..i * 4 + 4].copy_from_slice(&out);
+        inv = inv.mul(points[i].z);
+    }
+    let out = compress4(&points[0], inv);
+    pubs[0..4].copy_from_slice(&out);
 }
 
 #[cfg(test)]
@@ -795,6 +816,61 @@ mod tests {
                 .verifying_key()
                 .to_bytes();
             assert_eq!(pubs[i], expect, "lane {i}");
+        }
+    }
+
+    // Full BATCH=512 (128 groups): exercises the amortized batch inversion's
+    // prefix/back-substitution indexing across many groups, not just 2.
+    // Lane 0 is the RFC 8032 TEST 1 seed; every lane is checked against
+    // ed25519-dalek, and sampled keypairs must sign/verify.
+    #[test]
+    fn keygen512_batch_inversion_matches_dalek_and_rfc8032() {
+        use ed25519_dalek::{Signer, Verifier};
+        const N: usize = 512;
+        // RFC 8032 TEST 1: secret seed -> public key.
+        let rfc_seed: [u8; 32] = [
+            0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84,
+            0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4, 0x44, 0x49, 0xc5, 0x69,
+            0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
+            0x7f, 0x60,
+        ];
+        let rfc_pub: [u8; 32] = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b,
+            0xfe, 0xd3, 0xc9, 0x64, 0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3,
+            0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+            0x51, 0x1a,
+        ];
+        let mut seeds = [[0u8; 32]; N];
+        seeds[0] = rfc_seed;
+        for (i, s) in seeds.iter_mut().enumerate().skip(1) {
+            *s = Sha512::digest((i as u64).to_le_bytes()).as_slice()
+                [..32]
+                .try_into()
+                .unwrap();
+        }
+        let original = seeds;
+        let mut used = [[0u8; 32]; N];
+        let mut pubs = [[0u8; 32]; N];
+        unsafe { keygen_batch(&mut seeds, &mut used, &mut pubs) };
+        assert_eq!(pubs[0], rfc_pub, "RFC 8032 TEST 1 vector");
+        for i in 0..N {
+            assert_eq!(used[i], original[i], "lane {i} seed");
+            let sk = SigningKey::from_bytes(&original[i]);
+            assert_eq!(
+                pubs[i],
+                sk.verifying_key().to_bytes(),
+                "lane {i} pubkey"
+            );
+            // Chain semantics unchanged: next seed = SHA-512(seed)[32..64].
+            let h: [u8; 64] = Sha512::digest(original[i]).into();
+            assert_eq!(&seeds[i], &h[32..64], "lane {i} chain");
+            if i == 0 || i == N - 1 {
+                let sig = sk.sign(b"team1-oracle");
+                assert!(sk
+                    .verifying_key()
+                    .verify(b"team1-oracle", &sig)
+                    .is_ok());
+            }
         }
     }
 }

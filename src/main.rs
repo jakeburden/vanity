@@ -11,7 +11,9 @@ use ed25519_dalek::SigningKey;
 use num_bigint::BigUint;
 use num_format::{Locale, ToFormattedString};
 use num_traits::{One, ToPrimitive, Zero};
+use rand::RngCore;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "gpu")]
 use sha2::{Digest, Sha256};
 use solana_pubkey::Pubkey;
 #[cfg(feature = "deploy")]
@@ -749,15 +751,32 @@ fn ui_stop() {
     st.live = None;
 }
 
+/// Sleep for `dur`, returning `true` early if `shutdown` is set.
+/// Reporters used to sleep a full second and only then check the flag,
+/// so `reporter.join()` after a finished grind (and the final stats
+/// line) waited up to ~1s for a thread that had nothing left to do.
+/// Checking every 50ms keeps the 1Hz paint cadence and the same lock
+/// frequency, but bounds shutdown latency to ~50ms at the cost of 20
+/// relaxed atomic loads/s on an idle thread.
+fn wait_or_shutdown(shutdown: &AtomicBool, dur: Duration) -> bool {
+    let step = Duration::from_millis(50);
+    let mut waited = Duration::ZERO;
+    while waited < dur {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let s = step.min(dur - waited);
+        thread::sleep(s);
+        waited += s;
+    }
+    shutdown.load(Ordering::Relaxed)
+}
+
 fn spawn_ui_reporter(
     shutdown: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-        if shutdown.load(Ordering::SeqCst) {
+        if wait_or_shutdown(&shutdown, Duration::from_secs(1)) {
             break;
         }
         ui_refresh();
@@ -789,11 +808,7 @@ fn spawn_hashrate_reporter(
     start: Instant,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        thread::sleep(Duration::from_secs(1));
-        if shutdown.load(Ordering::SeqCst) {
+        if wait_or_shutdown(&shutdown, Duration::from_secs(1)) {
             break;
         }
         let elapsed = start.elapsed().as_secs_f64();
@@ -887,6 +902,15 @@ fn run_gpu_workers<const OUT: usize>(
         in_flight[i] = true;
     }
 
+    // Adaptive poll backoff: a fixed 10ms sleep added up to ~10ms of
+    // dead GPU time after every kernel finished (relaunch latency) and
+    // up to ~10ms to noticing a match. Start at 50µs and double to a
+    // 2ms cap, resetting after any device reports ready. This is a
+    // sleep, not a spin: in hybrid CPU+GPU grinds a spinning manager
+    // thread would steal a core from the CPU workers, while at the cap
+    // the manager still only issues ~500 queries/s/device. See
+    // PERF_TEAM_8.md for the measured sleep-granularity data.
+    let mut backoff = Duration::from_micros(50);
     loop {
         if done() {
             break;
@@ -913,8 +937,11 @@ fn run_gpu_workers<const OUT: usize>(
                 in_flight[i] = true;
             }
         }
-        if !any_ready {
-            thread::sleep(Duration::from_millis(10));
+        if any_ready {
+            backoff = Duration::from_micros(50);
+        } else {
+            thread::sleep(backoff);
+            backoff = (backoff * 2).min(Duration::from_millis(2));
         }
     }
 
@@ -922,8 +949,11 @@ fn run_gpu_workers<const OUT: usize>(
         if !in_flight[i] {
             continue;
         }
+        let mut drain_backoff = Duration::from_micros(50);
         while unsafe { (ops.query)(ctx.0) } == 0 {
-            thread::sleep(Duration::from_millis(10));
+            thread::sleep(drain_backoff);
+            drain_backoff =
+                (drain_backoff * 2).min(Duration::from_millis(2));
         }
         TOTAL_ATTEMPTS.fetch_add(read(ctx).1, Ordering::Relaxed);
     }
@@ -1082,6 +1112,52 @@ pub fn deploy_with_max_program_len_with_seed(
 
 // ─── grind ──────────────────────────────────────────────────────────────────
 
+/// Batched, per-thread CSPRNG seed supply for the CPU grind loops.
+///
+/// Security construction: each grind thread creates its own
+/// `SeedBlock`, which owns a `rand::thread_rng()` handle. In rand 0.8
+/// `ThreadRng` is a ChaCha12 CSPRNG kept in thread-local storage,
+/// seeded directly from the OS CSPRNG (`getrandom`) and automatically
+/// reseeded from it; it is never seeded from time, PID, counters, or
+/// any hand-rolled generator. The handle (and this block buffer) are
+/// created inside a single grind thread's closure and are never sent
+/// or shared across threads, so every thread draws from its own
+/// independent OS-seeded CSPRNG stream. Batching only changes *how
+/// often* we call `fill_bytes` (one 4–8 KiB fill per 256 seeds instead
+/// of one `rand::random()` call per seed); every byte handed out is
+/// still fresh output of that thread's CSPRNG, used exactly once as a
+/// seed and never reused (the block cursor only moves forward and a
+/// spent block is fully refilled before any byte is read again).
+struct SeedBlock<const BYTES: usize, const SEED: usize> {
+    rng: rand::rngs::ThreadRng,
+    block: [u8; BYTES],
+    /// Index of the next unused seed slot in `block`.
+    next: usize,
+}
+
+impl<const BYTES: usize, const SEED: usize> SeedBlock<BYTES, SEED> {
+    fn new() -> Self {
+        assert!(BYTES >= SEED && BYTES.is_multiple_of(SEED));
+        Self {
+            rng: rand::thread_rng(),
+            block: [0u8; BYTES],
+            next: BYTES / SEED,
+        }
+    }
+
+    fn next_seed(&mut self) -> [u8; SEED] {
+        if self.next >= BYTES / SEED {
+            self.rng.fill_bytes(&mut self.block);
+            self.next = 0;
+        }
+        let start = self.next * SEED;
+        self.next += 1;
+        self.block[start..start + SEED]
+            .try_into()
+            .unwrap()
+    }
+}
+
 fn grind(mut args: GrindArgs) {
     maybe_update_num_cpus(&mut args.num_cpus);
     let spec = resolve_spec(&args.spec);
@@ -1171,6 +1247,22 @@ fn grind(mut args: GrindArgs) {
         None
     };
 
+    // Team 9: specialised two-block SHA-256 for
+    // base(32) || seed(16) || owner(32), plus a grind-local byte
+    // prefilter so the base58 encode only runs for candidates that
+    // cannot be ruled out from the raw hash bytes. The authoritative
+    // string match below is unchanged; the prefilter never accepts,
+    // it only proves non-matches. See src/fast/grind_midstate.rs.
+    let hasher = fast::grind_midstate::GrindMidstate::new(
+        &args.base.to_bytes(),
+        &args.owner.to_bytes(),
+    );
+    let pairs = spec.pairs();
+    let prefilter = fast::grind_midstate::BytePrefilter::new(
+        &pairs,
+        spec.case_insensitive,
+    );
+
     let grind_start = Instant::now();
     ui_start(live, grind_start);
     let reporter = spawn_ui_reporter(Arc::clone(&shutdown));
@@ -1178,8 +1270,10 @@ fn grind(mut args: GrindArgs) {
     (0..args.num_cpus).into_par_iter().for_each(|i| {
         let timer = Instant::now();
         let mut local_batch = 0_u64;
+        // Per-thread batched CSPRNG (see `SeedBlock`); created inside
+        // this thread's closure and never shared.
+        let mut seeds = SeedBlock::<4096, 16>::new();
 
-        let base_sha = Sha256::new().chain_update(args.base);
         loop {
             if done(target_count) {
                 if local_batch > 0 {
@@ -1188,26 +1282,29 @@ fn grind(mut args: GrindArgs) {
                 return;
             }
 
-            let seed: [u8; 16] = rand::random();
+            let seed: [u8; 16] = seeds.next_seed();
             let seed: [u8; 16] = array::from_fn(|i| {
                 const ALNUM: &[u8] =
                     b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
                 ALNUM[seed[i] as usize % ALNUM.len()]
             });
 
-            let pubkey_bytes: [u8; 32] = base_sha
-                .clone()
-                .chain_update(seed)
-                .chain_update(args.owner)
-                .finalize()
-                .into();
-            let pubkey = fd_bs58::encode_32(pubkey_bytes);
+            let pubkey_bytes: [u8; 32] = hasher.pubkey_bytes(&seed);
 
             local_batch += 1;
             if local_batch >= 4096 {
                 TOTAL_ATTEMPTS.fetch_add(4096, Ordering::Relaxed);
                 local_batch -= 4096;
             }
+
+            // Exact rejection only: `false` proves no pattern can
+            // match these bytes, so the encode + string match can be
+            // skipped. `true` falls through to the unchanged
+            // authoritative check.
+            if !prefilter.could_match(&pubkey_bytes) {
+                continue;
+            }
+            let pubkey = fd_bs58::encode_32(pubkey_bytes);
 
             let mask = spec.match_mask(&pubkey);
             if mask != 0 && credit_kinds(mask, max_count) {
@@ -1493,6 +1590,9 @@ fn grind_doppler(mut args: DopplerArgs) {
     (0..args.num_cpus).into_par_iter().for_each(|i| {
         let timer = Instant::now();
         let mut local_batch = 0_u64;
+        // Per-thread batched CSPRNG (see `SeedBlock`); created inside
+        // this thread's closure and never shared.
+        let mut seeds = SeedBlock::<8192, 32>::new();
 
         loop {
             if done(target_count) {
@@ -1502,7 +1602,7 @@ fn grind_doppler(mut args: DopplerArgs) {
                 return;
             }
 
-            let seed: [u8; 32] = rand::random();
+            let seed: [u8; 32] = seeds.next_seed();
             let signing_key = SigningKey::from_bytes(&seed);
             let pubkey_bytes = signing_key.verifying_key().to_bytes();
 
@@ -1896,6 +1996,32 @@ mod tests {
                 suffix: String::new(),
             }
         );
+    }
+
+    #[test]
+    fn wait_or_shutdown_returns_promptly_when_set() {
+        let flag = AtomicBool::new(false);
+        assert!(!wait_or_shutdown(&flag, Duration::from_millis(60)));
+        flag.store(true, Ordering::Relaxed);
+        let t = Instant::now();
+        assert!(wait_or_shutdown(&flag, Duration::from_secs(5)));
+        assert!(t.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn seed_block_yields_unique_nonzero_seeds_across_refills() {
+        // 300 seeds > 256 slots in a 4096/16 block, so this crosses a
+        // refill boundary. 128-bit CSPRNG seeds colliding or repeating
+        // a spent block would fail here (collision chance ~300^2/2^129).
+        let mut block = SeedBlock::<4096, 16>::new();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..300 {
+            let s = block.next_seed();
+            assert_ne!(s, [0u8; 16]);
+            assert!(seen.insert(s), "seed reused");
+        }
+        let mut block32 = SeedBlock::<8192, 32>::new();
+        assert_ne!(block32.next_seed(), block32.next_seed());
     }
 
     #[test]

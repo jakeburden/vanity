@@ -48,10 +48,25 @@ num-format = "0.4.4"
 num-traits = "0.2"
 rand = "0.8.5"
 rayon = "1.10.0"
-sha2 = "0.10.8"
+# `compress` exposes sha2::compress256 for the grind loop's specialised
+# two-block hash (src/fast/grind_midstate.rs, Team 9). The hardware SHA
+# backend is enabled separately, target-scoped below, so x86 builds do
+# not swap in the sha2-asm assembly paths there.
+sha2 = { version = "0.10.8", features = ["compress"] }
 solana-pubkey = { version = "2.1.0", features = ["sha2"] }
 solana-rpc-client = { version = "2.1.0", optional = true }
 solana-sdk = { version = "2.1.0", optional = true }
+
+# Hardware SHA-256/SHA-512 on AArch64 (Teams 9/10): without this, sha2
+# 0.10 compiles its soft fallback even on CPUs with the crypto extensions.
+# The aarch64 backends are runtime-detected upstream (cpufeatures
+# "sha2"/"sha3") with the soft implementation as fallback, so baseline
+# portability is preserved. New transitive dependency: sha2-asm 0.6.4
+# (RustCrypto, same project as sha2), pinned in Cargo.lock. AArch64
+# builds now need a C assembler at build time (sha2-asm's build script),
+# which Rust toolchains already require as the linker driver.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { version = "0.10.8", features = ["asm-aarch64"] }
 
 [build-dependencies]
 cc = { version = "1.0.98", optional = true }
