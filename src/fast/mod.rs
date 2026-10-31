@@ -1,5 +1,6 @@
 mod check_match;
 mod field;
+pub mod grind_midstate;
 mod group;
 #[cfg(target_arch = "aarch64")]
 mod neon;
@@ -16,6 +17,7 @@ use crate::{
     check_write_permissions, credit_kinds, save_keypair, ABORTED,
     TOTAL_ATTEMPTS,
 };
+use rand::RngCore;
 #[cfg(any(test, not(target_arch = "aarch64")))]
 use sha2::{Digest, Sha512};
 use std::sync::atomic::Ordering;
@@ -211,8 +213,16 @@ unsafe fn keygen_batch_simd(
     simd::batch_compress(&points, &mut pubkeys[..]);
 }
 
-fn reseed_lane(seed: &mut [u8; 32]) {
-    *seed = rand::random();
+// Per-thread CSPRNG: `rand::thread_rng()` (rand 0.8) is a ChaCha12
+// CSPRNG seeded from the OS (getrandom) and automatically reseeded;
+// it is thread-local, so each grind thread creates its own handle
+// inside its `grind_thread_*` fn and never shares it across threads.
+// No time/PID/counter seeding and no hand-rolled RNG. The handle only
+// supplies fresh initial/reseed seeds — the subsequent per-batch lane
+// evolution via the SHA512 hash chain in `keygen_batch*` is the
+// pre-existing design and is unchanged here.
+fn reseed_lane(rng: &mut impl RngCore, seed: &mut [u8; 32]) {
+    rng.fill_bytes(seed);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -223,9 +233,12 @@ unsafe fn grind_thread_simd(
     max_count: u32,
 ) {
     check_write_permissions();
+    // Thread-local CSPRNG handle (see `reseed_lane`); created here,
+    // on this thread, and never shared.
+    let mut rng = rand::thread_rng();
     let mut seeds: [[u8; 32]; BATCH] = [[0u8; 32]; BATCH];
     for s in seeds.iter_mut() {
-        *s = rand::random();
+        rng.fill_bytes(&mut s[..]);
     }
     let mut used = [[0u8; 32]; BATCH];
     let mut pubkeys = [[0u8; 32]; BATCH];
@@ -241,11 +254,17 @@ unsafe fn grind_thread_simd(
             TOTAL_ATTEMPTS.fetch_add(local, Ordering::Relaxed);
             local = 0;
         }
+        // Active mask hoisted out of the per-key loop: computed once
+        // per batch, not once per key. Correctness: `credit_kinds`
+        // re-checks `unfilled_mask(quota)` and caps each kind with a
+        // CAS, so a mask that goes stale mid-batch (a kind fills
+        // after this snapshot) can only cause extra `match_mask_active`
+        // checks on later keys in the batch — `credit_kinds` filters
+        // those out, so nothing over-quota is ever credited or saved.
+        // (The same check-then-credit TOCTOU already existed per-key.)
+        let active = crate::unfilled_mask(max_count);
         for j in 0..BATCH {
-            let mask = target.match_mask_active(
-                &pubkeys[j],
-                crate::unfilled_mask(max_count),
-            );
+            let mask = target.match_mask_active(&pubkeys[j], active);
             if mask != 0 && credit_kinds(mask, max_count) {
                 let s = fd_bs58::encode_32(pubkeys[j]);
                 crate::ui_with_match(|| {
@@ -253,7 +272,7 @@ unsafe fn grind_thread_simd(
                     eprintln!("pubkey: {s}");
                     save_keypair(&used[j], &pubkeys[j], &s);
                 });
-                reseed_lane(&mut seeds[j]);
+                reseed_lane(&mut rng, &mut seeds[j]);
             }
         }
     }
@@ -267,9 +286,12 @@ fn grind_thread_neon(
     max_count: u32,
 ) {
     check_write_permissions();
+    // Thread-local CSPRNG handle (see `reseed_lane`); created here,
+    // on this thread, and never shared.
+    let mut rng = rand::thread_rng();
     let mut seeds: [[u8; 32]; BATCH] = [[0u8; 32]; BATCH];
     for s in seeds.iter_mut() {
-        *s = rand::random();
+        rng.fill_bytes(&mut s[..]);
     }
     let mut used = [[0u8; 32]; BATCH];
     let mut pubkeys = [[0u8; 32]; BATCH];
@@ -287,11 +309,17 @@ fn grind_thread_neon(
             TOTAL_ATTEMPTS.fetch_add(local, Ordering::Relaxed);
             local = 0;
         }
+        // Active mask hoisted out of the per-key loop: computed once
+        // per batch, not once per key. Correctness: `credit_kinds`
+        // re-checks `unfilled_mask(quota)` and caps each kind with a
+        // CAS, so a mask that goes stale mid-batch (a kind fills
+        // after this snapshot) can only cause extra `match_mask_active`
+        // checks on later keys in the batch — `credit_kinds` filters
+        // those out, so nothing over-quota is ever credited or saved.
+        // (The same check-then-credit TOCTOU already existed per-key.)
+        let active = crate::unfilled_mask(max_count);
         for j in 0..BATCH {
-            let mask = target.match_mask_active(
-                &pubkeys[j],
-                crate::unfilled_mask(max_count),
-            );
+            let mask = target.match_mask_active(&pubkeys[j], active);
             if mask != 0 && credit_kinds(mask, max_count) {
                 let s = fd_bs58::encode_32(pubkeys[j]);
                 crate::ui_with_match(|| {
@@ -299,7 +327,7 @@ fn grind_thread_neon(
                     eprintln!("pubkey: {s}");
                     save_keypair(&used[j], &pubkeys[j], &s);
                 });
-                reseed_lane(&mut seeds[j]);
+                reseed_lane(&mut rng, &mut seeds[j]);
             }
         }
     }
@@ -313,9 +341,12 @@ fn grind_thread_scalar(
     max_count: u32,
 ) {
     check_write_permissions();
+    // Thread-local CSPRNG handle (see `reseed_lane`); created here,
+    // on this thread, and never shared.
+    let mut rng = rand::thread_rng();
     let mut seeds: [[u8; 32]; BATCH] = [[0u8; 32]; BATCH];
     for s in seeds.iter_mut() {
-        *s = rand::random();
+        rng.fill_bytes(&mut s[..]);
     }
     let mut used = [[0u8; 32]; BATCH];
     let mut pubkeys = [[0u8; 32]; BATCH];
@@ -331,11 +362,17 @@ fn grind_thread_scalar(
             TOTAL_ATTEMPTS.fetch_add(local, Ordering::Relaxed);
             local = 0;
         }
+        // Active mask hoisted out of the per-key loop: computed once
+        // per batch, not once per key. Correctness: `credit_kinds`
+        // re-checks `unfilled_mask(quota)` and caps each kind with a
+        // CAS, so a mask that goes stale mid-batch (a kind fills
+        // after this snapshot) can only cause extra `match_mask_active`
+        // checks on later keys in the batch — `credit_kinds` filters
+        // those out, so nothing over-quota is ever credited or saved.
+        // (The same check-then-credit TOCTOU already existed per-key.)
+        let active = crate::unfilled_mask(max_count);
         for j in 0..BATCH {
-            let mask = target.match_mask_active(
-                &pubkeys[j],
-                crate::unfilled_mask(max_count),
-            );
+            let mask = target.match_mask_active(&pubkeys[j], active);
             if mask != 0 && credit_kinds(mask, max_count) {
                 let s = fd_bs58::encode_32(pubkeys[j]);
                 crate::ui_with_match(|| {
@@ -343,7 +380,7 @@ fn grind_thread_scalar(
                     eprintln!("pubkey: {s}");
                     save_keypair(&used[j], &pubkeys[j], &s);
                 });
-                reseed_lane(&mut seeds[j]);
+                reseed_lane(&mut rng, &mut seeds[j]);
             }
         }
     }
@@ -466,6 +503,7 @@ mod tests {
         let mut used = [[0u8; 32]; BATCH];
         let mut pubs = [[0u8; 32]; BATCH];
         let mut seeds_copy = seeds;
+        let mut rng = rand::thread_rng();
         keygen_batch(&mut seeds_copy, &mut used, &mut pubs);
         for j in 0..BATCH {
             assert_eq!(used[j], seeds[j]);
@@ -475,7 +513,7 @@ mod tests {
                 .verifying_key()
                 .to_bytes();
             assert_eq!(pubs[j], theirs, "lane {j}");
-            reseed_lane(&mut seeds_copy[j]);
+            reseed_lane(&mut rng, &mut seeds_copy[j]);
             assert_ne!(&seeds_copy[j], &h[32..64], "lane {j} reseed");
         }
     }
